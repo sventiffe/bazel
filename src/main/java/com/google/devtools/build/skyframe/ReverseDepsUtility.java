@@ -22,52 +22,39 @@ import com.google.common.collect.Iterables;
 import com.google.devtools.build.lib.collect.compacthashset.CompactHashSet;
 import com.google.devtools.build.skyframe.KeyToConsolidate.Op;
 import com.google.errorprone.annotations.CanIgnoreReturnValue;
+import java.util.AbstractList;
 import java.util.ArrayList;
 import java.util.Arrays;
 import java.util.Collection;
-import java.util.Collections;
 import java.util.HashSet;
 import java.util.List;
+import java.util.RandomAccess;
 import java.util.Set;
 
 /**
- * A utility class that allows us to store reverse dependencies in a memory-efficient way. At the
- * same time it allows us to group the removals and uniqueness checks so that it also performs well.
+ * Stores reverse dependencies and delayed reverse-dependency consolidation operations using
+ * primitive {@code int[]} arrays backed by {@link SkyKeyIdTable}.
  *
- * <p>The operations {@link #addReverseDep} and {@link #removeReverseDep} here are optimized for a
- * done entry. Done entries rarely have rdeps added and removed, but do have {@link Op#CHECK}
- * operations performed frequently. As well, done node entries may never have their data forcibly
- * consolidated, since their reverse deps will only be retrieved as a whole if they are marked
- * dirty. Thus, we consolidate periodically.
- *
- * <p>{@link IncrementalInMemoryNodeEntry} manages pending reverse dep operations on a marked-dirty
- * or initially evaluating node itself, using similar logic tuned to those cases, and calls into
- * {@link #consolidateDataAndReturnNewElements} when transitioning to done.
- *
- * <p>The storage schema for reverse dependencies of done node entries is:
+ * <p>Storage schema for reverse dependencies of done node entries:
  *
  * <ul>
  *   <li>0 rdeps: empty {@link ImmutableList}
  *   <li>1 rdep: bare {@link SkyKey}
- *   <li>2-4 rdeps: {@code SkyKey[]} (no nulls)
- *   <li>5+ rdeps: an {@link ArrayList}
+ *   <li>2-4 rdeps: exact-length {@code int[]} of positive {@link SkyKeyIdTable} IDs ({@code arr[0]
+ *       > 0})
+ *   <li>5+ rdeps: growable {@code int[]} where {@code arr[0] = -size} and {@code arr[1..size]} are
+ *       positive {@link SkyKeyIdTable} IDs (no {@link ArrayList} wrapper object and zero GC-traced
+ *       references)
  * </ul>
  *
- * This strategy saves memory in the common case of few reverse deps while still supporting constant
- * time additions for nodes with many rdeps by dynamically switching to an {@link ArrayList}.
+ * <p>Pending operations in {@code reverseDepsDataToConsolidate} are also stored in a primitive
+ * {@code int[]} where {@code arr[0] = count} and {@code arr[1..count]} pack {@code (op.ordinal() <<
+ * 30) | keyId}.
  */
 abstract class ReverseDepsUtility {
 
-  /**
-   * Returns the {@link Op} to store bare instead of wrapping in {@link KeyToConsolidate}.
-   *
-   * <p>We can store one type of operation bare in order to save memory. For nodes on their initial
-   * build and nodes not keeping reverse deps, most operations are {@link Op#ADD}.
-   *
-   * <p>Done nodes have very few delayed ops - {@link Op#CHECK} is never stored on a done node and
-   * {@link Op#ADD} is only delayed if there are already pending delayed ops. Returning {@link
-   * Op#CHECK} in this case just makes it easy to distinguish from nodes on their initial build.
-   */
+  private static final Op[] OP_VALUES = Op.values();
+
   static Op getOpToStoreBare(AbstractInMemoryNodeEntry<?> entry) {
     DirtyBuildingState dirtyBuildingState = entry.dirtyBuildingState;
     if (dirtyBuildingState == null) {
@@ -76,17 +63,52 @@ abstract class ReverseDepsUtility {
     return dirtyBuildingState.isIncremental() ? Op.CHECK : Op.ADD;
   }
 
+  private static int encodeOp(SkyKey key, Op op) {
+    return (op.ordinal() << 30) | SkyKeyIdTable.intern(key);
+  }
+
+  private static Op decodeOp(int encoded) {
+    return OP_VALUES[encoded >>> 30];
+  }
+
+  private static int decodeKeyId(int encoded) {
+    return encoded & SkyKeyIdTable.KEY_ID_MASK;
+  }
+
+  static void appendDelayedOp(IncrementalInMemoryNodeEntry entry, SkyKey reverseDep, Op op) {
+    int encoded = encodeOp(reverseDep, op);
+    int[] consolidations = entry.getReverseDepsDataToConsolidateForReverseDepsUtil();
+    if (consolidations == null) {
+      consolidations = new int[5];
+      consolidations[0] = 1;
+      consolidations[1] = encoded;
+      entry.setReverseDepsDataToConsolidateForReverseDepsUtil(consolidations);
+    } else {
+      int newCount = consolidations[0] + 1;
+      if (newCount >= consolidations.length) {
+        consolidations = Arrays.copyOf(consolidations, consolidations.length * 2 - 1);
+        entry.setReverseDepsDataToConsolidateForReverseDepsUtil(consolidations);
+      }
+      consolidations[newCount] = encoded;
+      consolidations[0] = newCount;
+    }
+  }
+
   private static void maybeDelayReverseDepOp(
       IncrementalInMemoryNodeEntry entry, SkyKey reverseDep, Op op) {
-    List<Object> consolidations = entry.getReverseDepsDataToConsolidateForReverseDepsUtil();
+    int[] consolidations = entry.getReverseDepsDataToConsolidateForReverseDepsUtil();
     int currentReverseDepSize = sizeOf(entry.getReverseDepsRawForReverseDepsUtil());
     if (consolidations == null) {
-      consolidations = new ArrayList<>(currentReverseDepSize);
+      int initCap = Math.max(4, currentReverseDepSize);
+      consolidations = new int[initCap + 1];
+      consolidations[0] = 1;
+      consolidations[1] = encodeOp(reverseDep, op);
       entry.setReverseDepsDataToConsolidateForReverseDepsUtil(consolidations);
+    } else {
+      appendDelayedOp(entry, reverseDep, op);
+      consolidations = entry.getReverseDepsDataToConsolidateForReverseDepsUtil();
     }
-    consolidations.add(KeyToConsolidate.create(reverseDep, op, entry));
-    // TODO(janakr): Should we consolidate more aggressively? This threshold can be customized.
-    if (consolidations.size() >= currentReverseDepSize) {
+    if (consolidations[0] >= currentReverseDepSize) {
       consolidateData(entry);
     }
   }
@@ -95,24 +117,55 @@ abstract class ReverseDepsUtility {
     return raw instanceof SkyKey;
   }
 
+  private static final class IntRdepsView extends AbstractList<SkyKey> implements RandomAccess {
+    private final int[] arr;
+    private final int offset;
+    private final int size;
+
+    IntRdepsView(int[] arr, int offset, int size) {
+      this.arr = arr;
+      this.offset = offset;
+      this.size = size;
+    }
+
+    @Override
+    public SkyKey get(int index) {
+      Preconditions.checkElementIndex(index, size);
+      return SkyKeyIdTable.get(arr[offset + index]);
+    }
+
+    @Override
+    public int size() {
+      return size;
+    }
+  }
+
   @SuppressWarnings("unchecked")
   private static List<SkyKey> multipleAsList(Object raw) {
-    return raw instanceof SkyKey[] ? Arrays.asList((SkyKey[]) raw) : (List<SkyKey>) raw;
+    if (raw instanceof int[] arr) {
+      if (arr.length == 0) {
+        return ImmutableList.of();
+      }
+      if (arr[0] < 0) {
+        return new IntRdepsView(arr, 1, -arr[0]);
+      }
+      return new IntRdepsView(arr, 0, arr.length);
+    }
+    return (List<SkyKey>) raw;
   }
 
   private static int sizeOf(Object raw) {
     if (isSingleReverseDep(raw)) {
       return 1;
     }
-    if (raw instanceof SkyKey[]) {
-      return ((SkyKey[]) raw).length;
+    if (raw instanceof int[] arr) {
+      return arr.length == 0 ? 0 : (arr[0] < 0 ? -arr[0] : arr.length);
     }
     return ((List<?>) raw).size();
   }
 
-  @SuppressWarnings("unchecked") // Cast to List<SkyKey>.
   static void addReverseDep(IncrementalInMemoryNodeEntry entry, SkyKey newReverseDep) {
-    List<Object> dataToConsolidate = entry.getReverseDepsDataToConsolidateForReverseDepsUtil();
+    int[] dataToConsolidate = entry.getReverseDepsDataToConsolidateForReverseDepsUtil();
     if (dataToConsolidate != null) {
       maybeDelayReverseDepOp(entry, newReverseDep, Op.ADD);
       return;
@@ -122,18 +175,27 @@ abstract class ReverseDepsUtility {
     if (newSize == 1) {
       entry.setReverseDepsForReverseDepsUtil(newReverseDep);
     } else if (newSize == 2) {
-      entry.setReverseDepsForReverseDepsUtil(new SkyKey[] {(SkyKey) raw, newReverseDep});
+      entry.setReverseDepsForReverseDepsUtil(
+          new int[] {SkyKeyIdTable.intern((SkyKey) raw), SkyKeyIdTable.intern(newReverseDep)});
     } else if (newSize <= 4) {
-      SkyKey[] newArray = Arrays.copyOf((SkyKey[]) raw, newSize);
-      newArray[newSize - 1] = newReverseDep;
+      int[] newArray = Arrays.copyOf((int[]) raw, newSize);
+      newArray[newSize - 1] = SkyKeyIdTable.intern(newReverseDep);
       entry.setReverseDepsForReverseDepsUtil(newArray);
     } else if (newSize == 5) {
-      List<SkyKey> newList = new ArrayList<>(8);
-      Collections.addAll(newList, (SkyKey[]) raw);
-      newList.add(newReverseDep);
-      entry.setReverseDepsForReverseDepsUtil(newList);
+      int[] oldArr = (int[]) raw;
+      int[] newArr = new int[9];
+      newArr[0] = -5;
+      System.arraycopy(oldArr, 0, newArr, 1, 4);
+      newArr[5] = SkyKeyIdTable.intern(newReverseDep);
+      entry.setReverseDepsForReverseDepsUtil(newArr);
     } else {
-      ((List<SkyKey>) raw).add(newReverseDep);
+      int[] arr = (int[]) raw;
+      if (newSize >= arr.length) {
+        arr = Arrays.copyOf(arr, arr.length * 2 - 1);
+        entry.setReverseDepsForReverseDepsUtil(arr);
+      }
+      arr[newSize] = SkyKeyIdTable.intern(newReverseDep);
+      arr[0] = -newSize;
     }
   }
 
@@ -160,9 +222,6 @@ abstract class ReverseDepsUtility {
       IncrementalInMemoryNodeEntry entry, boolean checkConsistency) {
     consolidateData(entry);
 
-    // TODO(bazel-team): Unfortunately, we need to make a copy here right now to be on the safe side
-    // wrt. thread-safety. The parents of a node get modified when any of the parents is deleted,
-    // and we can't handle that right now.
     var raw = entry.getReverseDepsRawForReverseDepsUtil();
     if (isSingleReverseDep(raw)) {
       return ImmutableSet.of((SkyKey) raw);
@@ -176,7 +235,7 @@ abstract class ReverseDepsUtility {
         Set<SkyKey> seen = new HashSet<>();
         Set<SkyKey> duplicates = new HashSet<>();
         for (SkyKey key : reverseDeps) {
-          if (seen.add(key)) {
+          if (!seen.add(key)) {
             duplicates.add(key);
           }
         }
@@ -193,13 +252,12 @@ abstract class ReverseDepsUtility {
 
   private static Set<SkyKey> consolidateDataAndReturnNewElements(
       IncrementalInMemoryNodeEntry entry, boolean mutateObject) {
-    List<Object> dataToConsolidate = entry.getReverseDepsDataToConsolidateForReverseDepsUtil();
+    int[] dataToConsolidate = entry.getReverseDepsDataToConsolidateForReverseDepsUtil();
     if (dataToConsolidate == null) {
       return ImmutableSet.of();
     }
+    int dataLen = dataToConsolidate[0];
 
-    // On a node's initial build (or if not keeping rdeps), we don't need to build up two different
-    // sets for "all reverse deps" and "new reverse deps" - they are all new.
     Op opToStoreBare = getOpToStoreBare(entry);
     boolean allRdepsAreNew = opToStoreBare == Op.ADD;
     Set<SkyKey> allReverseDeps;
@@ -214,76 +272,106 @@ abstract class ReverseDepsUtility {
       if (allRdepsAreNew) {
         Preconditions.checkState(reverseDepsAsList.isEmpty(), entry);
         allReverseDeps = null;
-        newReverseDeps = CompactHashSet.createWithExpectedSize(dataToConsolidate.size());
+        newReverseDeps = CompactHashSet.createWithExpectedSize(dataLen);
       } else {
         allReverseDeps = getReverseDepsSet(entry, reverseDepsAsList);
         newReverseDeps = CompactHashSet.create();
       }
     }
 
-    for (Object keyToConsolidate : dataToConsolidate) {
-      SkyKey key = KeyToConsolidate.key(keyToConsolidate);
-      switch (KeyToConsolidate.op(keyToConsolidate, opToStoreBare)) {
+    boolean hadRemoveOnInitial = false;
+    for (int i = 1; i <= dataLen; i++) {
+      int encoded = dataToConsolidate[i];
+      Op op = decodeOp(encoded);
+      SkyKey key = SkyKeyIdTable.get(decodeKeyId(encoded));
+      switch (op) {
         case CHECK:
           Preconditions.checkState(!allRdepsAreNew, entry);
           Preconditions.checkState(
               allReverseDeps.contains(key),
-              "Reverse dep not present: %s %s %s %s",
-              keyToConsolidate,
+              "Reverse dep not present: %s %s %s",
+              key,
               allReverseDeps,
-              dataToConsolidate,
               entry);
           Preconditions.checkState(
               newReverseDeps.add(key),
-              "Duplicate new reverse dep: %s %s %s %s",
-              keyToConsolidate,
+              "Duplicate new reverse dep: %s %s %s",
+              key,
               allReverseDeps,
-              dataToConsolidate,
               entry);
           break;
         case REMOVE:
+          hadRemoveOnInitial = true;
           if (!allRdepsAreNew) {
             Preconditions.checkState(
                 allReverseDeps.remove(key),
-                "Reverse dep to be removed not present: %s %s %s %s",
-                keyToConsolidate,
+                "Reverse dep to be removed not present: %s %s %s",
+                key,
                 allReverseDeps,
-                dataToConsolidate,
                 entry);
           }
           Preconditions.checkState(
               newReverseDeps.remove(key) || !allRdepsAreNew,
-              "Reverse dep to be removed not present: %s %s %s %s",
-              keyToConsolidate,
+              "Reverse dep to be removed not present: %s %s %s",
+              key,
               newReverseDeps,
-              dataToConsolidate,
               entry);
           break;
         case ADD:
           if (!allRdepsAreNew) {
             Preconditions.checkState(
                 allReverseDeps.add(key),
-                "Duplicate reverse deps: %s %s %s %s",
-                keyToConsolidate,
+                "Duplicate reverse deps: %s %s %s",
+                key,
                 raw,
-                dataToConsolidate,
                 entry);
           }
           Preconditions.checkState(
               newReverseDeps.add(key),
-              "Duplicate new reverse deps: %s %s %s %s",
-              keyToConsolidate,
+              "Duplicate new reverse deps: %s %s %s",
+              key,
               raw,
-              dataToConsolidate,
               entry);
           break;
       }
     }
     if (mutateObject) {
       entry.setReverseDepsDataToConsolidateForReverseDepsUtil(null);
-      writeReverseDeps(entry, allRdepsAreNew ? newReverseDeps : allReverseDeps);
+      if (allRdepsAreNew && !hadRemoveOnInitial) {
+        // Fast path for initial build: reuse the already-interned key IDs in dataToConsolidate
+        // without re-interning every SkyKey in writeReverseDeps.
+        writeReverseDepsFromInitialData(entry, dataToConsolidate, dataLen, newReverseDeps);
+      } else {
+        writeReverseDeps(entry, allRdepsAreNew ? newReverseDeps : allReverseDeps);
+      }
     }
     return newReverseDeps;
+  }
+
+  private static void writeReverseDepsFromInitialData(
+      IncrementalInMemoryNodeEntry entry,
+      int[] dataToConsolidate,
+      int count,
+      Set<SkyKey> newReverseDeps) {
+    if (!entry.keepsEdges() || count == 0) {
+      entry.setReverseDepsForReverseDepsUtil(ImmutableList.of());
+    } else if (count == 1) {
+      entry.setReverseDepsForReverseDepsUtil(Iterables.getOnlyElement(newReverseDeps));
+    } else if (count <= 4) {
+      int[] arr = new int[count];
+      for (int i = 0; i < count; i++) {
+        arr[i] = decodeKeyId(dataToConsolidate[i + 1]);
+      }
+      entry.setReverseDepsForReverseDepsUtil(arr);
+    } else {
+      int[] arr =
+          dataToConsolidate.length == count + 1 ? dataToConsolidate : new int[count + 1];
+      arr[0] = -count;
+      for (int i = 1; i <= count; i++) {
+        arr[i] = dataToConsolidate[i] & SkyKeyIdTable.KEY_ID_MASK;
+      }
+      entry.setReverseDepsForReverseDepsUtil(arr);
+    }
   }
 
   @CanIgnoreReturnValue
@@ -292,37 +380,33 @@ abstract class ReverseDepsUtility {
   }
 
   static void consolidateData(IncrementalInMemoryNodeEntry entry) {
-    List<Object> dataToConsolidate = entry.getReverseDepsDataToConsolidateForReverseDepsUtil();
+    int[] dataToConsolidate = entry.getReverseDepsDataToConsolidateForReverseDepsUtil();
     if (dataToConsolidate == null) {
       return;
     }
     entry.setReverseDepsDataToConsolidateForReverseDepsUtil(null);
+    int dataLen = dataToConsolidate[0];
     var raw = entry.getReverseDepsRawForReverseDepsUtil();
     if (isSingleReverseDep(raw)) {
       Preconditions.checkState(
-          dataToConsolidate.size() == 1,
+          dataLen == 1,
           "dataToConsolidate not size 1 even though only one rdep: %s %s %s",
-          dataToConsolidate,
+          dataLen,
           raw,
           entry);
-      Object keyToConsolidate = Iterables.getOnlyElement(dataToConsolidate);
-      SkyKey key = KeyToConsolidate.key(keyToConsolidate);
+      int encoded = dataToConsolidate[1];
+      SkyKey key = SkyKeyIdTable.get(decodeKeyId(encoded));
       Preconditions.checkState(getOpToStoreBare(entry) == Op.CHECK, entry);
-      switch (KeyToConsolidate.op(keyToConsolidate, Op.CHECK)) {
+      switch (decodeOp(encoded)) {
         case REMOVE:
           entry.setReverseDepsForReverseDepsUtil(ImmutableList.of());
           // Fall through to check.
         case CHECK:
-          Preconditions.checkState(key.equals(raw), "%s %s %s", keyToConsolidate, raw, entry);
+          Preconditions.checkState(key.equals(raw), "%s %s %s", key, raw, entry);
           break;
         case ADD:
           throw new IllegalStateException(
-              "Shouldn't delay add if only one element: "
-                  + keyToConsolidate
-                  + ", "
-                  + raw
-                  + ", "
-                  + entry);
+              "Shouldn't delay add if only one element: " + key + ", " + raw + ", " + entry);
       }
       return;
     }
@@ -330,35 +414,19 @@ abstract class ReverseDepsUtility {
     Set<SkyKey> reverseDepsAsSet = getReverseDepsSet(entry, reverseDepsAsList);
 
     Preconditions.checkState(getOpToStoreBare(entry) == Op.CHECK, entry);
-    for (Object keyToConsolidate : dataToConsolidate) {
-      SkyKey key = KeyToConsolidate.key(keyToConsolidate);
-      switch (KeyToConsolidate.op(keyToConsolidate, Op.CHECK)) {
+    for (int i = 1; i <= dataLen; i++) {
+      int encoded = dataToConsolidate[i];
+      SkyKey key = SkyKeyIdTable.get(decodeKeyId(encoded));
+      switch (decodeOp(encoded)) {
         case CHECK:
           Preconditions.checkState(
-              reverseDepsAsSet.contains(key),
-              "%s %s %s %s",
-              keyToConsolidate,
-              reverseDepsAsSet,
-              dataToConsolidate,
-              entry);
+              reverseDepsAsSet.contains(key), "%s %s %s", key, reverseDepsAsSet, entry);
           break;
         case REMOVE:
-          Preconditions.checkState(
-              reverseDepsAsSet.remove(key),
-              "%s %s %s %s",
-              keyToConsolidate,
-              raw,
-              dataToConsolidate,
-              entry);
+          Preconditions.checkState(reverseDepsAsSet.remove(key), "%s %s %s", key, raw, entry);
           break;
         case ADD:
-          Preconditions.checkState(
-              reverseDepsAsSet.add(key),
-              "%s %s %s %s",
-              keyToConsolidate,
-              raw,
-              dataToConsolidate,
-              entry);
+          Preconditions.checkState(reverseDepsAsSet.add(key), "%s %s %s", key, raw, entry);
           break;
       }
     }
@@ -373,9 +441,21 @@ abstract class ReverseDepsUtility {
     } else if (reverseDeps.size() == 1) {
       entry.setReverseDepsForReverseDepsUtil(Iterables.getOnlyElement(reverseDeps));
     } else if (reverseDeps.size() <= 4) {
-      entry.setReverseDepsForReverseDepsUtil(reverseDeps.toArray(SkyKey[]::new));
+      int[] arr = new int[reverseDeps.size()];
+      int i = 0;
+      for (SkyKey k : reverseDeps) {
+        arr[i++] = SkyKeyIdTable.intern(k);
+      }
+      entry.setReverseDepsForReverseDepsUtil(arr);
     } else {
-      entry.setReverseDepsForReverseDepsUtil(new ArrayList<>(reverseDeps));
+      int n = reverseDeps.size();
+      int[] arr = new int[n + 1];
+      arr[0] = -n;
+      int i = 1;
+      for (SkyKey k : reverseDeps) {
+        arr[i++] = SkyKeyIdTable.intern(k);
+      }
+      entry.setReverseDepsForReverseDepsUtil(arr);
     }
   }
 
@@ -391,7 +471,6 @@ abstract class ReverseDepsUtility {
     if (reverseDepsAsSet.size() == reverseDepsAsList.size()) {
       return;
     }
-    // We're about to crash. Try to print an informative error message.
     Set<SkyKey> seen = new HashSet<>();
     List<SkyKey> duplicates = new ArrayList<>();
     for (SkyKey key : reverseDepsAsList) {
@@ -408,9 +487,10 @@ abstract class ReverseDepsUtility {
   }
 
   static String toString(IncrementalInMemoryNodeEntry entry) {
+    var raw = entry.getReverseDepsRawForReverseDepsUtil();
     return MoreObjects.toStringHelper("ReverseDeps")
-        .add("reverseDeps", entry.getReverseDepsRawForReverseDepsUtil())
-        .add("singleReverseDep", isSingleReverseDep(entry))
+        .add("reverseDeps", isSingleReverseDep(raw) ? raw : multipleAsList(raw))
+        .add("singleReverseDep", isSingleReverseDep(raw))
         .add("dataToConsolidate", entry.getReverseDepsDataToConsolidateForReverseDepsUtil())
         .toString();
   }

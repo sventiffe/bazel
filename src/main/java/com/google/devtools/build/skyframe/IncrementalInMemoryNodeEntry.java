@@ -81,7 +81,7 @@ public class IncrementalInMemoryNodeEntry extends AbstractInMemoryNodeEntry<Dirt
    * calculate the set of reverse deps to signal when this entry finishes evaluation. That is done
    * by {@link ReverseDepsUtility#consolidateDataAndReturnNewElements}.
    */
-  private List<Object> reverseDepsDataToConsolidate = null;
+  private int[] reverseDepsDataToConsolidate = null;
 
   public IncrementalInMemoryNodeEntry(SkyKey key) {
     super(key);
@@ -232,7 +232,7 @@ public class IncrementalInMemoryNodeEntry extends AbstractInMemoryNodeEntry<Dirt
 
   /** Sets {@link #reverseDepsDataToConsolidate}. Does not alter {@link #reverseDeps}. */
   synchronized void setReverseDepsDataToConsolidateForReverseDepsUtil(
-      List<Object> dataToConsolidate) {
+      int[] dataToConsolidate) {
     this.reverseDepsDataToConsolidate = dataToConsolidate;
   }
 
@@ -240,17 +240,14 @@ public class IncrementalInMemoryNodeEntry extends AbstractInMemoryNodeEntry<Dirt
     return this.reverseDeps;
   }
 
-  synchronized List<Object> getReverseDepsDataToConsolidateForReverseDepsUtil() {
+  synchronized int[] getReverseDepsDataToConsolidateForReverseDepsUtil() {
     return this.reverseDepsDataToConsolidate;
   }
 
   private synchronized void appendToReverseDepOperations(SkyKey reverseDep, Op op) {
     checkState(!isDone(), "Don't append to done %s %s %s", this, reverseDep, op);
-    if (reverseDepsDataToConsolidate == null) {
-      reverseDepsDataToConsolidate = new ArrayList<>();
-    }
     checkState(isDirty() || op != Op.CHECK, "Not dirty check %s %s", this, reverseDep);
-    reverseDepsDataToConsolidate.add(KeyToConsolidate.create(reverseDep, op, this));
+    ReverseDepsUtility.appendDelayedOp(this, reverseDep, op);
   }
 
   @Override

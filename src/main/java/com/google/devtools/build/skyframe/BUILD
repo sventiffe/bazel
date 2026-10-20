@@ -20,6 +20,7 @@ SKYFRAME_OBJECT_SRCS = [
     "SkyFunctionException.java",
     "SkyFunctionName.java",
     "SkyKey.java",
+    "SkyKeyIdTable.java",
     "SkyValue.java",
 ]
 
